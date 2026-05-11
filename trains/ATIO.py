@@ -9,6 +9,8 @@ class ATIO():
     def __init__(self):
         self.TRAIN_MAP = {
             'DLF': DLF,
+            'DLF_CLEAN': DLF,
+            'DLF_SLE': DLF,
         }
     
     def getTrain(self, args):
