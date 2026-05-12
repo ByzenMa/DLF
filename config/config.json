@@ -124,7 +124,8 @@
     "baseModel": "DLF",
     "commonParams": {
       "sle_num_feature_experts": 2,
-      "sle_num_shared_experts": 2
+      "sle_num_shared_experts": 2,
+      "sle_num_layers": 2
     }
   }
 }

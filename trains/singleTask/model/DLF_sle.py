@@ -2,8 +2,9 @@
 DLF backbone with Separated Layer Extraction (SLE).
 
 The SLE block follows the PLE idea of routing each input through modality-specific
-feature experts and shared experts, then fusing them with per-modality gates before
-the regular DLF disentanglement, reconstruction, and fusion pipeline.
+feature experts and shared experts across configurable stacked extraction
+layers, then fusing them with per-modality gates before the regular DLF
+disentanglement, reconstruction, and fusion pipeline.
 """
 import torch
 import torch.nn as nn
@@ -14,21 +15,50 @@ from ...subNets.transformers_encoder.transformer import TransformerEncoder
 
 
 class GatedExpertFusion(nn.Module):
-    """Fuse modality-specific experts and common shared experts with a sample-wise gate."""
+    """Fuse feature and shared experts with PLE-style feature/shared gates."""
 
     def __init__(self, feature_experts, embed_dim, num_shared_experts):
         super().__init__()
         self.feature_experts = nn.ModuleList(feature_experts)
-        self.gate = nn.Linear(embed_dim, len(self.feature_experts) + num_shared_experts)
+        num_total_experts = len(self.feature_experts) + num_shared_experts
+        self.feature_gate = nn.Linear(embed_dim, num_total_experts)
+        self.shared_gate = nn.Linear(embed_dim, num_total_experts)
 
-    def forward(self, x, shared_experts):
-        expert_outputs = [expert(x) for expert in self.feature_experts]
-        expert_outputs.extend(expert(x) for expert in shared_experts)
+    @staticmethod
+    def _gated_sum(expert_outputs, gate, gate_input):
+        gate_weights = F.softmax(gate(gate_input.mean(dim=0)), dim=-1).transpose(0, 1)
+        return (expert_outputs * gate_weights[:, None, :, None]).sum(dim=0)
+
+    def forward(self, feature_x, shared_x, shared_experts):
+        expert_outputs = [expert(feature_x) for expert in self.feature_experts]
+        expert_outputs.extend(expert(shared_x) for expert in shared_experts)
         expert_outputs = torch.stack(expert_outputs, dim=0)
 
-        gate_input = x.mean(dim=0)
-        gate_weights = F.softmax(self.gate(gate_input), dim=-1).transpose(0, 1)
-        return (expert_outputs * gate_weights[:, None, :, None]).sum(dim=0)
+        feature_out = self._gated_sum(expert_outputs, self.feature_gate, feature_x)
+        shared_out = self._gated_sum(expert_outputs, self.shared_gate, shared_x)
+        return feature_out, shared_out
+
+
+class SLEExtractionLayer(nn.Module):
+    """One PLE-style extraction layer for text, audio, and video streams."""
+
+    def __init__(self, build_experts, embed_dim, num_feature_experts, num_shared_experts):
+        super().__init__()
+        self.shared_experts = nn.ModuleList(build_experts("l", num_shared_experts))
+        self.text_fusion = self._build_fusion(build_experts, "l", embed_dim, num_feature_experts, num_shared_experts)
+        self.audio_fusion = self._build_fusion(build_experts, "a", embed_dim, num_feature_experts, num_shared_experts)
+        self.video_fusion = self._build_fusion(build_experts, "v", embed_dim, num_feature_experts, num_shared_experts)
+
+    @staticmethod
+    def _build_fusion(build_experts, self_type, embed_dim, num_feature_experts, num_shared_experts):
+        feature_experts = build_experts(self_type, num_feature_experts)
+        return GatedExpertFusion(feature_experts, embed_dim, num_shared_experts)
+
+    def forward(self, x_l, x_a, x_v, shared_l, shared_a, shared_v):
+        x_l, shared_l = self.text_fusion(x_l, shared_l, self.shared_experts)
+        x_a, shared_a = self.audio_fusion(x_a, shared_a, self.shared_experts)
+        x_v, shared_v = self.video_fusion(x_v, shared_v, self.shared_experts)
+        return x_l, x_a, x_v, shared_l, shared_a, shared_v
 
 
 class DLF_sle(nn.Module):
@@ -71,17 +101,20 @@ class DLF_sle(nn.Module):
         self.proj_v = nn.Conv1d(self.orig_d_v, self.d_v, kernel_size=args.conv1d_kernel_size_v, padding=0, bias=False)
 
         # Separated Layer Extraction (SLE) experts.
+        self.sle_num_layers = self._get_positive_int_arg(args, "sle_num_layers", default=2)
         self.sle_num_feature_experts = self._get_positive_int_arg(
             args, "sle_num_feature_experts", "sle_num_specific_experts", default=2
         )
         self.sle_num_shared_experts = self._get_positive_int_arg(args, "sle_num_shared_experts", default=2)
-        self.sle_shared_experts = nn.ModuleList(
-            self.get_network(self_type="l", layers=self.layers)
-            for _ in range(self.sle_num_shared_experts)
+        self.sle_layers = nn.ModuleList(
+            SLEExtractionLayer(
+                self._build_sle_experts,
+                self.d_l,
+                self.sle_num_feature_experts,
+                self.sle_num_shared_experts,
+            )
+            for _ in range(self.sle_num_layers)
         )
-        self.sle_l = self._build_sle_fusion("l", self.d_l)
-        self.sle_a = self._build_sle_fusion("a", self.d_a)
-        self.sle_v = self._build_sle_fusion("v", self.d_v)
 
         # Disentanglement encoders.
         self.encoder_s_l = self.get_network(self_type="l", layers=self.layers)
@@ -152,12 +185,19 @@ class DLF_sle(nn.Module):
             raise ValueError(f"{primary_name} must be >= 1, got {value}")
         return value
 
-    def _build_sle_fusion(self, self_type, embed_dim):
-        feature_experts = [
+    def _build_sle_experts(self, self_type, num_experts):
+        return [
             self.get_network(self_type=self_type, layers=self.layers)
-            for _ in range(self.sle_num_feature_experts)
+            for _ in range(num_experts)
         ]
-        return GatedExpertFusion(feature_experts, embed_dim, self.sle_num_shared_experts)
+
+    def _apply_sle_layers(self, x_l, x_a, x_v):
+        shared_l, shared_a, shared_v = x_l, x_a, x_v
+        for sle_layer in self.sle_layers:
+            x_l, x_a, x_v, shared_l, shared_a, shared_v = sle_layer(
+                x_l, x_a, x_v, shared_l, shared_a, shared_v
+            )
+        return x_l, x_a, x_v
 
     def get_network(self, self_type="l", layers=-1):
         if self_type in ["l", "al", "vl", "l_mem"]:
@@ -211,9 +251,7 @@ class DLF_sle(nn.Module):
         proj_x_v = proj_x_v.permute(2, 0, 1)
         proj_x_a = proj_x_a.permute(2, 0, 1)
 
-        sle_x_l = self.sle_l(proj_x_l, self.sle_shared_experts)
-        sle_x_v = self.sle_v(proj_x_v, self.sle_shared_experts)
-        sle_x_a = self.sle_a(proj_x_a, self.sle_shared_experts)
+        sle_x_l, sle_x_a, sle_x_v = self._apply_sle_layers(proj_x_l, proj_x_a, proj_x_v)
 
         s_l = self.encoder_s_l(sle_x_l)
         s_v = self.encoder_s_v(sle_x_v)
