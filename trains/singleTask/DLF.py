@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -127,9 +128,11 @@ class DLF():
                     ids = torch.cat(ids, dim=0)
                     loss_sim = self.sim_loss(ids, feats)
 
-                    #overall loss L_DLF
-                    combined_loss = loss_task + (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1   
-                
+                    # overall loss L_DLF
+                    combined_loss = loss_task + (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1
+                    if getattr(self.args, 'use_mine_loss', False) and 'mine_loss' in output:
+                        combined_loss = combined_loss + self.args.mine_loss_weight * output['mine_loss']
+
                     combined_loss.backward()
 
 
@@ -166,13 +169,16 @@ class DLF():
             cur_valid = val_results[self.args.KeyEval]
             scheduler.step(val_results['Loss'])
             # save each epoch model
-            torch.save(model[0].state_dict(), './pt/' + str(self.args.dataset_name) + '_' + str(epochs) + '.pth')
+            epoch_model_path = Path('./pt') / f"{self.args.model_name}_{self.args.dataset_name}_{epochs}.pth"
+            epoch_model_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(model[0].state_dict(), epoch_model_path)
             # save best model
             isBetter = cur_valid <= (best_valid - 1e-6) if min_or_max == 'min' else cur_valid >= (best_valid + 1e-6)
             if isBetter:
                 best_valid, best_epoch = cur_valid, epochs
                 # save model
-                model_save_path = './pt/DLF' + str(self.args.dataset_name)+'.pth'
+                model_save_path = Path(self.args.model_save_path)
+                model_save_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(model[0].state_dict(), model_save_path)
 
             if return_epoch_results:
