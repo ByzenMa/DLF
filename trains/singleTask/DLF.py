@@ -128,9 +128,11 @@ class DLF():
                     ids = torch.cat(ids, dim=0)
                     loss_sim = self.sim_loss(ids, feats)
 
-                    #overall loss L_DLF
-                    combined_loss = loss_task + (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1   
-                
+                    # overall loss L_DLF
+                    combined_loss = loss_task + (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1
+                    if getattr(self.args, 'use_mine_loss', False) and 'mine_loss' in output:
+                        combined_loss = combined_loss + self.args.mine_loss_weight * output['mine_loss']
+
                     combined_loss.backward()
 
 

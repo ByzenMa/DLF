@@ -6,6 +6,8 @@ feature experts and shared experts across configurable stacked extraction
 layers, then fusing them with per-modality gates before the regular DLF
 disentanglement, reconstruction, and fusion pipeline.
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -61,6 +63,25 @@ class SLEExtractionLayer(nn.Module):
         return x_l, x_a, x_v, shared_l, shared_a, shared_v
 
 
+class MINE(nn.Module):
+    """Mutual Information Neural Estimator used as an optional auxiliary loss."""
+
+    def __init__(self, data_dim, hidden_size=10):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(data_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def forward(self, x, y):
+        y_marginal = torch.roll(y, shifts=1, dims=0)
+        joint_logits = self.layers(torch.cat([x, y], dim=1))
+        marginal_logits = self.layers(torch.cat([x, y_marginal], dim=1))
+        log_mean_exp = torch.logsumexp(marginal_logits, dim=0) - math.log(marginal_logits.size(0))
+        return -math.log2(math.e) * (torch.mean(joint_logits) - log_mean_exp.squeeze(0))
+
+
 class DLF_sle(nn.Module):
     """DLF with PLE-style separated layer extraction for text/audio/video inputs."""
 
@@ -101,20 +122,34 @@ class DLF_sle(nn.Module):
         self.proj_v = nn.Conv1d(self.orig_d_v, self.d_v, kernel_size=args.conv1d_kernel_size_v, padding=0, bias=False)
 
         # Separated Layer Extraction (SLE) experts.
+        self.use_sle = bool(getattr(args, "use_sle", True))
         self.sle_num_layers = self._get_positive_int_arg(args, "sle_num_layers", default=2)
         self.sle_num_feature_experts = self._get_positive_int_arg(
             args, "sle_num_feature_experts", "sle_num_specific_experts", default=2
         )
         self.sle_num_shared_experts = self._get_positive_int_arg(args, "sle_num_shared_experts", default=2)
-        self.sle_layers = nn.ModuleList(
-            SLEExtractionLayer(
-                self._build_sle_experts,
-                self.d_l,
-                self.sle_num_feature_experts,
-                self.sle_num_shared_experts,
+        if self.use_sle:
+            self.sle_layers = nn.ModuleList(
+                SLEExtractionLayer(
+                    self._build_sle_experts,
+                    self.d_l,
+                    self.sle_num_feature_experts,
+                    self.sle_num_shared_experts,
+                )
+                for _ in range(self.sle_num_layers)
             )
-            for _ in range(self.sle_num_layers)
-        )
+        else:
+            self.sle_layers = nn.ModuleList()
+
+        # Optional MINE auxiliary loss over SLE modality features.
+        self.use_mine_loss = bool(getattr(args, "use_mine_loss", False)) and self.use_sle
+        self.mine_loss_weight = float(getattr(args, "mine_loss_weight", 0.1))
+        mine_hidden_size = int(getattr(args, "mine_hidden_size", 10))
+        if self.use_mine_loss:
+            mine_data_dim = self.d_l * 2
+            self.mine_l_a = MINE(mine_data_dim, mine_hidden_size)
+            self.mine_l_v = MINE(mine_data_dim, mine_hidden_size)
+            self.mine_a_v = MINE(mine_data_dim, mine_hidden_size)
 
         # Disentanglement encoders.
         self.encoder_s_l = self.get_network(self_type="l", layers=self.layers)
@@ -199,6 +234,16 @@ class DLF_sle(nn.Module):
             )
         return x_l, x_a, x_v
 
+    def _compute_mine_loss(self, x_l, x_a, x_v):
+        h_l = x_l.mean(dim=0)
+        h_a = x_a.mean(dim=0)
+        h_v = x_v.mean(dim=0)
+        return (
+            self.mine_l_a(h_l, h_a)
+            + self.mine_l_v(h_l, h_v)
+            + self.mine_a_v(h_a, h_v)
+        ) / 3
+
     def get_network(self, self_type="l", layers=-1):
         if self_type in ["l", "al", "vl", "l_mem"]:
             embed_dim, attn_dropout = self.d_l, self.attn_dropout
@@ -251,14 +296,17 @@ class DLF_sle(nn.Module):
         proj_x_v = proj_x_v.permute(2, 0, 1)
         proj_x_a = proj_x_a.permute(2, 0, 1)
 
-        sle_x_l, sle_x_a, sle_x_v = self._apply_sle_layers(proj_x_l, proj_x_a, proj_x_v)
+        if self.use_sle:
+            model_x_l, model_x_a, model_x_v = self._apply_sle_layers(proj_x_l, proj_x_a, proj_x_v)
+        else:
+            model_x_l, model_x_a, model_x_v = proj_x_l, proj_x_a, proj_x_v
 
-        s_l = self.encoder_s_l(sle_x_l)
-        s_v = self.encoder_s_v(sle_x_v)
-        s_a = self.encoder_s_a(sle_x_a)
-        c_l = self.encoder_c(sle_x_l)
-        c_v = self.encoder_c(sle_x_v)
-        c_a = self.encoder_c(sle_x_a)
+        s_l = self.encoder_s_l(model_x_l)
+        s_v = self.encoder_s_v(model_x_v)
+        s_a = self.encoder_s_a(model_x_a)
+        c_l = self.encoder_c(model_x_l)
+        c_v = self.encoder_c(model_x_v)
+        c_a = self.encoder_c(model_x_a)
 
         s_l_bct, s_v_bct, s_a_bct = s_l.permute(1, 2, 0), s_v.permute(1, 2, 0), s_a.permute(1, 2, 0)
         c_l_bct, c_v_bct, c_a_bct = c_l.permute(1, 2, 0), c_v.permute(1, 2, 0), c_a.permute(1, 2, 0)
@@ -311,10 +359,10 @@ class DLF_sle(nn.Module):
         last_hs = torch.cat([last_h_l, last_h_v, last_h_a, c_fusion], dim=1)
         output = self.out_layer(self._residual_head(last_hs, self.proj1, self.proj2))
 
-        return {
-            "origin_l": sle_x_l,
-            "origin_v": sle_x_v,
-            "origin_a": sle_x_a,
+        res = {
+            "origin_l": model_x_l,
+            "origin_v": model_x_v,
+            "origin_a": model_x_a,
             "projected_l": proj_x_l,
             "projected_v": proj_x_v,
             "projected_a": proj_x_a,
@@ -339,6 +387,9 @@ class DLF_sle(nn.Module):
             "logits_c": logits_c,
             "output_logit": output,
         }
+        if self.use_mine_loss:
+            res["mine_loss"] = self._compute_mine_loss(model_x_l, model_x_a, model_x_v)
+        return res
 
 
 # Compatibility alias: allows `getattr(DLF_sle, "DLF")` in existing run scripts.

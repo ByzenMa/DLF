@@ -123,9 +123,13 @@
   "DLF_SLE": {
     "baseModel": "DLF",
     "commonParams": {
+      "use_sle": true,
       "sle_num_feature_experts": 2,
       "sle_num_shared_experts": 2,
-      "sle_num_layers": 2
+      "sle_num_layers": 2,
+      "use_mine_loss": false,
+      "mine_loss_weight": 0.1,
+      "mine_hidden_size": 10
     }
   }
 }
