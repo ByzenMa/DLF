@@ -10,7 +10,7 @@ from config import get_config_regression
 from data_loader import MMDataLoader
 from trains import ATIO
 from utils import assign_gpu, setup_seed
-from trains.singleTask.model import DLF
+from importlib import import_module
 from trains.singleTask.distillnets import get_distillation_kernel, get_distillation_kernel_homo
 from trains.singleTask.misc import softmax
 import sys
@@ -24,6 +24,19 @@ formatted_now = str(formatted_now)+" - "
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:2"
 logger = logging.getLogger('MMSA')
+
+MODEL_MODULES = {
+    "DLF": ("trains.singleTask.model.DLF", "DLF"),
+    "DLF_SLE": ("trains.singleTask.model.DLF_sle", "DLF_sle"),
+}
+
+
+def _get_model_class(model_name):
+    if model_name not in MODEL_MODULES:
+        raise ValueError(f"Unsupported model {model_name}. Supported models: {list(MODEL_MODULES)}")
+    module_name, class_name = MODEL_MODULES[model_name]
+    return getattr(import_module(module_name), class_name)
+
 
 def _set_logger(log_dir, model_name, dataset_name, verbose_level):
 
@@ -127,7 +140,7 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
     dataloader = MMDataLoader(args, num_workers)
 
     if args.is_training:
-        print("training for DLF")
+        print(f"training for {args.model_name}")
 
         
         args.gd_size_low = 64  
@@ -144,7 +157,8 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
         assert len(from_idx) >= 1
 
         model = []
-        model_DLF = getattr(DLF, 'DLF')(args)
+        model_class = _get_model_class(args.model_name)
+        model_DLF = model_class(args)
 
         model_distill_homo = getattr(get_distillation_kernel_homo, 'DistillationKernel')(n_classes=1,
                                                                                hidden_size=
@@ -174,8 +188,9 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
 
         model = [model_DLF]         
     else:
-        print("testing phase for DLF")
-        model = getattr(DLF, 'DLF')(args)
+        print(f"testing phase for {args.model_name}")
+        model_class = _get_model_class(args.model_name)
+        model = model_class(args)
         model = model.cuda()
 
     trainer = ATIO().getTrain(args)
@@ -183,14 +198,14 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
 
     #test
     if args.mode == 'test':
-        model.load_state_dict(torch.load('./pt/DLF'+str(args.dataset_name)+'.pth'),strict=False) 
+        model.load_state_dict(torch.load(args.model_save_path), strict=False)
         results = trainer.do_test(model, dataloader['test'], mode="TEST")
         sys.stdout.flush()
         input('[Press Any Key to start another run]')
     #train
     else:
         epoch_results = trainer.do_train(model, dataloader, return_epoch_results=from_sena)
-        model[0].load_state_dict(torch.load('./pt/DLF'+str(args.dataset_name)+'.pth'))
+        model[0].load_state_dict(torch.load(args.model_save_path))
 
         results = trainer.do_test(model[0], dataloader['test'], mode="TEST")
 
