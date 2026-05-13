@@ -27,7 +27,6 @@ logger = logging.getLogger('MMSA')
 
 MODEL_MODULES = {
     "DLF": ("trains.singleTask.model.DLF", "DLF"),
-    "DLF_CLEAN": ("trains.singleTask.model.DLF_clean", "DLF_clean"),
     "DLF_SLE": ("trains.singleTask.model.DLF_sle", "DLF_sle"),
 }
 

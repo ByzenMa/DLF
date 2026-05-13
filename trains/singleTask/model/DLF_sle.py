@@ -141,13 +141,8 @@ class DLF_sle(nn.Module):
         else:
             self.sle_layers = nn.ModuleList()
 
-<<<<<<< codex/refactor-dlf.py-and-create-dlf_clean.py-eaavwg
         # Optional MINE auxiliary loss over the actual DLF backbone inputs.
         self.use_mine_loss = bool(getattr(args, "use_mine_loss", False))
-=======
-        # Optional MINE auxiliary loss over SLE modality features.
-        self.use_mine_loss = bool(getattr(args, "use_mine_loss", False)) and self.use_sle
->>>>>>> main
         self.mine_loss_weight = float(getattr(args, "mine_loss_weight", 0.1))
         mine_hidden_size = int(getattr(args, "mine_hidden_size", 10))
         if self.use_mine_loss:

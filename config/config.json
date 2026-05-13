@@ -117,9 +117,6 @@
       }
     }
   },
-  "DLF_CLEAN": {
-    "baseModel": "DLF"
-  },
   "DLF_SLE": {
     "baseModel": "DLF",
     "commonParams": {
